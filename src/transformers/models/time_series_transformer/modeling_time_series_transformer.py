@@ -93,23 +93,33 @@ class TimeSeriesStdScaler(nn.Module):
             Controls whether to retain dimension `dim` (of length 1) in the scale tensor, or suppress it.
         minimum_scale (`float`, *optional*, defaults to 1e-5):
             Default scale that is used for elements that are constantly zero along dimension `dim`.
+        input_size (`int`, *optional*, defaults to 1):
+            The size of the target variable which by default is 1 for univariate targets. Would be > 1 in case of
+            multivariate targets.
     """
 
-    def __init__(self, dim: int, keepdim: bool = False, minimum_scale: float = 1e-5):
+    def __init__(self, dim: int, keepdim: bool = False, minimum_scale: float = 1e-5, input_size: int = 1):
         super().__init__()
         if not dim > 0:
             raise ValueError("Cannot compute scale along dim = 0 (batch dimension), please provide dim > 0")
         self.dim = dim
         self.keepdim = keepdim
         self.minimum_scale = minimum_scale
+        self.input_size = input_size
 
     @torch.no_grad()
     def forward(self, data: torch.Tensor, weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         denominator = weights.sum(self.dim, keepdim=self.keepdim)
         denominator = denominator.clamp_min(1.0)
-        loc = (data * weights).sum(self.dim, keepdim=self.keepdim) / denominator
+        if self.input_size > 1:
+            denominator = denominator.unsqueeze(1)
+            w = weights.unsqueeze(2)
+        else:
+            w = weights
 
-        variance = (((data - loc) * weights) ** 2).sum(self.dim, keepdim=self.keepdim) / denominator
+        loc = (data * w).sum(self.dim, keepdim=self.keepdim) / denominator
+
+        variance = (((data - loc) * w) ** 2).sum(self.dim, keepdim=self.keepdim) / denominator
         scale = torch.sqrt(variance + self.minimum_scale)
         return (data - loc) / scale, loc, scale
 
@@ -128,23 +138,37 @@ class TimeSeriesMeanScaler(nn.Module):
             Default scale that is used for elements that are constantly zero. If `None`, we use the scale of the batch.
         minimum_scale (`float`, *optional*, defaults to 1e-10):
             Default minimum possible scale that is used for any item.
+        input_size (`int`, *optional*, defaults to 1):
+            The size of the target variable which by default is 1 for univariate targets. Would be > 1 in case of
+            multivariate targets.
     """
 
     def __init__(
-        self, dim: int = -1, keepdim: bool = True, default_scale: Optional[float] = None, minimum_scale: float = 1e-10
+        self,
+        dim: int = -1,
+        keepdim: bool = True,
+        default_scale: Optional[float] = None,
+        minimum_scale: float = 1e-10,
+        input_size: int = 1,
     ):
         super().__init__()
         self.dim = dim
         self.keepdim = keepdim
         self.minimum_scale = minimum_scale
         self.default_scale = default_scale
+        self.input_size = input_size
 
     @torch.no_grad()
     def forward(
         self, data: torch.Tensor, observed_indicator: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # shape: (N, [C], T=1)
-        ts_sum = (data * observed_indicator).abs().sum(self.dim, keepdim=True)
+
+        if self.input_size == 1:
+            ts_sum = (data * observed_indicator).abs().sum(self.dim, keepdim=True)
+        else:
+            ts_sum = (data * observed_indicator.unsqueeze(2)).abs().sum(self.dim, keepdim=True).squeeze(1)
+
         num_observed = observed_indicator.sum(self.dim, keepdim=True)
 
         scale = ts_sum / torch.clamp(num_observed, min=1)
@@ -163,10 +187,16 @@ class TimeSeriesMeanScaler(nn.Module):
 
         # ensure the scale is at least `self.minimum_scale`
         scale = torch.clamp(scale, min=self.minimum_scale)
-        scaled_data = data / scale
+        if self.input_size == 1:
+            scaled_data = data / scale
+        else:
+            scaled_data = data / scale.unsqueeze(1)
 
         if not self.keepdim:
             scale = scale.squeeze(dim=self.dim)
+
+        if self.input_size > 1:
+            scale = scale.unsqueeze(1)
 
         return scaled_data, torch.zeros_like(scale), scale
 
@@ -200,6 +230,22 @@ def nll(input: torch.distributions.Distribution, target: torch.Tensor) -> torch.
     Computes the negative log likelihood loss from input distribution with respect to target.
     """
     return -input.log_prob(target)
+
+
+def kl_ts_uncertainty(input: torch.distributions.Distribution, target: torch.Tensor) -> torch.Tensor:
+    """
+    Computes the KL-divergence between the input distribution with respect to target. Assumes that the target
+    distribution is characterized as a Normal distribution with the mean in the first dimension and the variance in the
+    second dimension.
+    """
+    # the first dimension of the target is the mean and the second dimension is the variance
+    p = torch.distributions.normal.Normal(target[:, :, 0], target[:, :, 1])
+
+    # interpret the input distribution as a normal distribution with the mean in the first dimension
+    # and the variance in first dimension
+    q = torch.distributions.normal.Normal(input.base_dist.mean[:, :, 0], input.base_dist.variance[:, :, 0])
+    torch.distributions.kl_divergence(p, q)
+    return torch.distributions.kl_divergence(p, q)
 
 
 def weighted_average(input_tensor: torch.Tensor, weights: Optional[torch.Tensor] = None, dim=None) -> torch.Tensor:
@@ -1180,9 +1226,9 @@ class TimeSeriesTransformerModel(TimeSeriesTransformerPreTrainedModel):
         super().__init__(config)
 
         if config.scaling == "mean" or config.scaling is True:
-            self.scaler = TimeSeriesMeanScaler(dim=1, keepdim=True)
+            self.scaler = TimeSeriesMeanScaler(dim=1, keepdim=True, input_size=config.input_size)
         elif config.scaling == "std":
-            self.scaler = TimeSeriesStdScaler(dim=1, keepdim=True)
+            self.scaler = TimeSeriesStdScaler(dim=1, keepdim=True, input_size=config.input_size)
         else:
             self.scaler = TimeSeriesNOPScaler(dim=1, keepdim=True)
 
@@ -1454,6 +1500,10 @@ class TimeSeriesTransformerForPrediction(TimeSeriesTransformerPreTrainedModel):
 
         if config.loss == "nll":
             self.loss = nll
+        elif config.loss == "kl_ts_uncertainty":
+            if config.input_size != 2:
+                raise ValueError("KL divergence can only be used when the input size is 2.")
+            self.loss = kl_ts_uncertainty
         else:
             raise ValueError(f"Unknown loss function {config.loss}")
 
@@ -1578,7 +1628,6 @@ class TimeSeriesTransformerForPrediction(TimeSeriesTransformerPreTrainedModel):
             params = self.output_params(outputs[0])  # outputs.last_hidden_state
             # loc is 3rd last and scale is 2nd last output
             distribution = self.output_distribution(params, loc=outputs[-3], scale=outputs[-2])
-
             loss = self.loss(distribution, future_values)
 
             if future_observed_mask is None:
@@ -1587,7 +1636,7 @@ class TimeSeriesTransformerForPrediction(TimeSeriesTransformerPreTrainedModel):
             if len(self.target_shape) == 0:
                 loss_weights = future_observed_mask
             else:
-                loss_weights, _ = future_observed_mask.min(dim=-1, keepdim=False)
+                loss_weights, _ = future_observed_mask.min(dim=-1, keepdim=True)
 
             prediction_loss = weighted_average(loss, weights=loss_weights)
 
